@@ -4,7 +4,7 @@ from typing import Optional, List
 from collections import defaultdict, deque
 import httpx
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Algolens Live Tracker")
@@ -42,7 +42,8 @@ class TransactionStat(BaseModel):
 # -------------------------------
 # In-memory sliding window
 # -------------------------------
-MAX_TX_WINDOW = 1000
+MAX_TX_WINDOW = 500
+LIVE_WINDOW_SECONDS = 300 
 recent_txs = deque(maxlen=MAX_TX_WINDOW)
 wallet_activity = defaultdict(int)
 lock = asyncio.Lock()
@@ -140,6 +141,21 @@ def format_timestamp(ts: int):
 # -------------------------------
 @app.on_event("startup")
 async def startup_event():
+    global last_round
+    async with httpx.AsyncClient(timeout=10) as client:
+        # Try node status endpoint
+        url = "https://mainnet-api.4160.nodely.dev/v2/status"
+        try:
+            response = await client.get(url)
+            response.raise_for_status()
+            status = response.json()
+            last_round = status.get("last-round", 0)
+        except httpx.HTTPStatusError:
+            # Fallback: just default last_round to 0 or some safe value
+            print("Status endpoint not available, defaulting last_round = 0")
+            last_round = 0
+
+    # Start the background task
     asyncio.create_task(update_wallet_activity())
 
 # -------------------------------
@@ -160,8 +176,15 @@ async def get_live_wallets(limit: int = 10):
     return {"most_active_wallets": formatted}
 
 @app.get("/transactions/live")
-async def get_live_transactions(limit: int = 50): 
+async def get_live_transactions(limit: int = 10): 
     async with lock: 
         tx_list = list(recent_txs)[-limit:]
         tx_list.reverse()
-    return {"recent_transactions": [tx.dict() for tx in tx_list]}
+
+        formatted_txs = []
+        for tx in tx_list:
+            d = tx.dict()
+            d["timestamp"] = datetime.fromtimestamp(d["timestamp"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            formatted_txs.append(d)
+
+    return {"recent_transactions": formatted_txs}
